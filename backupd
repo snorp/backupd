@@ -1,0 +1,156 @@
+#!/usr/bin/python
+
+import sys
+import os
+import dbus
+
+from dbus.mainloop.glib import DBusGMainLoop
+import gobject
+
+import subprocess
+import ConfigParser
+import os.path
+import logging
+import logging.handlers
+
+_DEVKIT_IFACE = "org.freedesktop.DeviceKit.Disks"
+_DEVKIT_PATH = "/org/freedesktop/DeviceKit/Disks"
+_DEVICE_IFACE = _DEVKIT_IFACE + ".Device"
+
+_MAIN_SECTION = "Main"
+
+_LOG_FILENAME = "/var/log/backupd.log"
+
+class Backup:
+    
+    system_bus = None
+    devkit = None
+    device = None
+    
+    def __init__(self):
+        # set up logging
+        self.logger = logging.getLogger('backupd')
+        self.logger.setLevel(logging.INFO)
+        
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        
+        fh = logging.handlers.RotatingFileHandler(_LOG_FILENAME, maxBytes=1024 * 1024 * 5, backupCount=5)
+        ch = logging.StreamHandler() # goes to stderr
+        
+        fh.setFormatter(formatter)
+        ch.setFormatter(formatter)
+        
+        self.logger.addHandler(fh)
+        self.logger.addHandler(ch)
+        
+        # read in config
+        self._read_config()
+        
+        # set up dbus
+        self.system_bus = dbus.SystemBus();
+        self.devkit = dbus.Interface(self.system_bus.get_object(_DEVKIT_IFACE, _DEVKIT_PATH), _DEVKIT_IFACE)
+        
+        self.system_bus.add_signal_receiver(self._on_devkit_signal, 'DeviceAdded', _DEVKIT_IFACE)
+        
+        self._find_backup_disk()
+        
+    def _read_config(self):
+        config = ConfigParser.RawConfigParser()
+        config.read('/etc/backupd.conf')
+            
+        self.device_uuid = config.get(_MAIN_SECTION, 'DEVICE_UUID')
+        self.backup_dirs = config.get(_MAIN_SECTION, 'BACKUP_DIRS').split(':')
+    
+    def _get_dbus_properties(self, path):
+        return dbus.Interface(self.system_bus.get_object(_DEVKIT_IFACE, path), dbus.PROPERTIES_IFACE)
+        
+    def _is_backup_disk(self, device):
+        return device.Get(_DEVICE_IFACE, "id-uuid") == self.device_uuid
+        
+    def _find_backup_disk(self):
+        devices = self.devkit.EnumerateDevices()
+        for path in devices:
+            device = self._get_dbus_properties(path)
+            if self._is_backup_disk(device):
+                self.device = device
+                break
+                
+    def _mount_backup_disk(self):
+        if self.device.Get(_DEVICE_IFACE, 'device-is-mounted'):
+            return self.device.Get(_DEVICE_IFACE, 'device-mount-paths')[0]
+            
+        device = dbus.Interface(self.device, _DEVICE_IFACE)
+        return device.FilesystemMount('auto', [])
+        
+    def _unmount_backup_disk(self):
+        try:
+            device = dbus.Interface(self.device, _DEVICE_IFACE)
+            device.FilesystemUnmount([])
+        except Exception as e:
+            self.logger.error("Unmount failed: " + `e`)
+
+    def _error_beep(self):
+        for i in range(3):
+            os.system('beep -f 2000 -n -f 1000')
+            
+    def _success_beep(self):
+        os.system('beep -f 1000')
+        os.system('beep -f 1300')
+        os.system('beep -f 1500')
+    
+    def _start_beep(self):
+        os.system('beep -f 3000 -r 2 -d 1')
+        
+    def backup(self):
+        if not self.device:
+            raise Exception('No backup device!')
+        
+        self.logger.info('Starting backup')
+        
+        self._start_beep()
+        mount_point = self._mount_backup_disk()
+        self.logger.info('Mounted backup device at: ' + mount_point)
+        
+        try:
+            for bd in self.backup_dirs:
+                self.logger.info('Backing up: ' + bd)
+                ret = subprocess.call(["rdiff-backup", "--no-compression", bd, os.path.join(mount_point, os.path.basename(bd))])
+                if ret != 0:
+                    raise Exception('Backup failed!')
+            
+            self._unmount_backup_disk()
+            self._success_beep()
+            self.logger.info('Backup was successful!')        
+        except Exception as e:
+            self.logger.error('Backup failed: ' + `e`)
+            self._unmount_backup_disk()
+            self._error_beep()
+    
+    def maybe_backup(self):
+        if self.device:
+            self.backup()
+        else:
+            self.logger.info('No backup disk detected, waiting for it to be plugged in...')
+    
+    def _on_devkit_signal(self, member=None):
+        device = self._get_dbus_properties(member)
+        if self._is_backup_disk(device):
+            self.logger.info('Backup disk was plugged in: ' + device.Get(_DEVICE_IFACE, 'device-file'))
+            self.device = device
+            self.backup()
+        
+if __name__ == '__main__':
+    # make sure we are root
+    if os.geteuid() != 0:
+        print 'Must be root!'
+        sys.exit(1)
+    
+    DBusGMainLoop(set_as_default=True)
+    
+    b = Backup()
+    
+    b.maybe_backup()
+    
+    loop = gobject.MainLoop()
+    loop.run()
+    
